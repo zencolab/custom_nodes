@@ -8,21 +8,14 @@ import os
 from google import genai
 from google.genai import types
 
-# ==========================================
-# 罪魁祸首修复：终极智能密钥拦截器
-# ==========================================
 def get_secure_api_key(input_key):
-    # 只要输入框里包含任何中文字符（不管填了啥），一律去底层拿真实密钥
     if not input_key or input_key.strip() == "" or any('\u4e00' <= c <= '\u9fa5' for c in input_key):
-        # 1. 优先尝试 Kaggle Secrets
         try:
             from kaggle_secrets import UserSecretsClient
             return UserSecretsClient().get_secret("GEMINI_API_KEY")
         except Exception:
             pass
-        # 2. 降级尝试系统环境变量
         return os.environ.get("GEMINI_API_KEY", "")
-    
     return input_key.strip()
 
 def get_gcp_client(api_key_input):
@@ -31,7 +24,6 @@ def get_gcp_client(api_key_input):
         print("[StoryFlow] ❌ 致命错误：未能获取到真实的 API Key！")
         return None
     try:
-        # 接入 300 刀企业级通道
         return genai.Client(vertexai=True, api_key=real_api_key)
     except Exception as e:
         print(f"[StoryFlow] SDK Client init failed: {e}")
@@ -130,7 +122,7 @@ class StoryboardEditorCN:
             return (["Error: Translation failed."],)
 
 # ==========================================
-# 节点 3：批量出图
+# 节点 3：批量出图 (终极自适应防爆版)
 # ==========================================
 class APIBatchGeneratorCN:
     @classmethod
@@ -147,12 +139,14 @@ class APIBatchGeneratorCN:
     CATEGORY = "StoryFlow中文版 (企业级通道)"
 
     def generate_batch(self, prompts_list, gemini_api_key, model_name):
-        error_img = torch.zeros((1, 512, 512, 3), dtype=torch.float32)
-        error_img[:, :, :, 0] = 1.0 
-        
         client = get_gcp_client(gemini_api_key)
         images = []
-        if not client: return (torch.cat([error_img] * max(1, len(prompts_list)), dim=0),)
+        
+        # 兜底：如果连密钥都没，直接返回一张红图
+        if not client: 
+            error_img = torch.zeros((1, 512, 512, 3), dtype=torch.float32)
+            error_img[:, :, :, 0] = 1.0
+            return (torch.cat([error_img] * max(1, len(prompts_list)), dim=0),)
 
         print(f"[StoryFlow] 开始批量出图任务，使用模型: {model_name}，共计 {len(prompts_list)} 张。")
         img_config = types.GenerateContentConfig(
@@ -160,10 +154,13 @@ class APIBatchGeneratorCN:
             image_config=types.ImageConfig(aspect_ratio="16:9", output_mime_type="image/png")
         )
 
+        # 1. 遍历出图，成功的放张量，失败的放 None 占位
         for i, prompt in enumerate(prompts_list):
             if "Error" in prompt:
-                images.append(error_img)
+                print(f"  [-] 第 {i+1} 张图：由于前期报错，跳过。")
+                images.append(None)
                 continue
+            
             print(f"  [>] 正在生成第 {i+1} 张图...")
             try:
                 response = client.models.generate_content(
@@ -174,8 +171,24 @@ class APIBatchGeneratorCN:
                 images.append(torch.from_numpy(np.array(img).astype(np.float32) / 255.0).unsqueeze(0))
                 print(f"  [+] 第 {i+1} 张图生成成功！")
             except Exception as e:
-                print(f"  [x] 第 {i+1} 张图生成失败: {e}")
-                images.append(error_img)
+                print(f"  [x] 第 {i+1} 张图生成失败 (可能触发安全限制或网络波动): {e}")
+                images.append(None)
 
-        print("[StoryFlow] 🎉 全部出图任务完成！")
-        return (torch.cat(images, dim=0) if images else error_img,)
+        # 2. 动态维度匹配大法：看看成功出图的是什么尺寸
+        valid_tensors = [img for img in images if img is not None]
+        if valid_tensors:
+            # 拿到第一张成功图片的精准尺寸 (例如 1x768x1344x3)
+            ref_shape = valid_tensors[0].shape 
+        else:
+            # 全军覆没，默认 512x512
+            ref_shape = (1, 512, 512, 3) 
+
+        # 3. 按照真实尺寸，量身定制红色警告图
+        error_img = torch.zeros(ref_shape, dtype=torch.float32)
+        error_img[:, :, :, 0] = 1.0 # 涂红
+
+        # 4. 把所有的 None 替换成合身的高清红图
+        final_images = [img if img is not None else error_img for img in images]
+
+        print("[StoryFlow] 🎉 全部出图任务完成！即将发送给预览节点。")
+        return (torch.cat(final_images, dim=0),)
